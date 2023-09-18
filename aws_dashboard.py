@@ -32,10 +32,6 @@ def correlate_security_groups(instances, group):
                 'group_name': group_name
             })
         except KeyError:
-            # print()
-            # print("No tags found for security group")
-            # print(groups)
-            # print()
             pass
         
     # # identify which instance is associated with which security group in allowed_ports
@@ -62,18 +58,19 @@ def correlate_security_groups(instances, group):
                 instance_names.append('NA')
                 sg['Service or Instance'] = instance_names
             correlated_security_group.append(sg)
+                    
     return correlated_security_group
 
 def get_open_ports(security_group_id):
     ec2_client = boto3.client('ec2')
     response = ec2_client.describe_security_groups(GroupIds=[security_group_id])
-    #print(response)
     security_group = response['SecurityGroups'][0]
     ip_permissions = security_group['IpPermissions']
     ip_permissions_egress = security_group['IpPermissionsEgress']
     allowed_ports = []
     
     for permission in ip_permissions:
+        
         from_port = permission.get('FromPort', 'NA')
         to_port = permission.get('ToPort', 'NA')
         protocol = permission.get('IpProtocol', 'NA')
@@ -101,7 +98,7 @@ def get_open_ports(security_group_id):
                     'IPRange': 'NA',
                     'GroupID': group_id
                 })
-
+        
     for permission in ip_permissions_egress:
         from_port = permission.get('FromPort', 'NA')
         to_port = permission.get('ToPort', 'NA')
@@ -145,13 +142,19 @@ def get_instances():
             state = instance['State']['Name']
             tags = instance['Tags']
             instance_name = next((tag['Value'] for tag in tags if tag['Key'] == 'Name'), 'NA')
-            private_ip = instance['PrivateIpAddress']
+
+            try:
+                private_ip = instance['PrivateIpAddress']
+            except KeyError:
+                private_ip = 'NA'
+
             groups = instance['SecurityGroups']
             security_groups = [sg['GroupId'] for sg in groups]
             allowed_ports = []
 
             for sg in security_groups:
                allowed_ports.append(get_open_ports(sg)) 
+
             try:
                 public_ip = instance['PublicIpAddress']
             except KeyError:
@@ -178,20 +181,24 @@ def rotate_elastic_ip(instance_name, instance_id, public_ip):
         st.write("No elastic IP found for : ", instance_name)
         return
     current_allocation_id = response['Addresses'][0]['AllocationId']
-    #dissassociate elastic IP
+    #disassociate elastic IP
     try:
         response_dissassociate = ec2_client.disassociate_address(PublicIp=public_ip)
     except:
-        st.write("Not allowed to dissassociate IP for : ", instance_name)
+        st.write("Not allowed to disassociate IP for : ", instance_name)
         return
+
     #release current elastic IP
     response_release_ip = ec2_client.release_address(AllocationId=current_allocation_id)
+    
     #allocate new elastic IP
     response_new_ip = ec2_client.allocate_address(Domain='vpc')['PublicIp']
+    
     #associate new elastic IP
     response_associate = ec2_client.associate_address(PublicIp=response_new_ip, InstanceId=instance_id)
+    
     #return new elastic IP
-    store_public_ips(instance_name, response_new_ip)
+    store_public_ips(instance_id, instance_name, response_new_ip)
     return response_new_ip
 
 def restart_instance(instance_name, instance_id):
@@ -208,46 +215,76 @@ def create_database():
         conn = sqlite3.connect('public_ips.db')
         cursor = conn.cursor()
         cursor.execute('''CREATE TABLE IF NOT EXISTS public_ips 
-                        (instance_name TEXT, public_ip TEXT, timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+                        (instance_id TEXT, instance_name TEXT, public_ip TEXT, timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
         conn.commit()
         conn.close()
 
-def store_public_ips(instance_name, public_ip):
+def store_public_ips(instance_id, instance_name, public_ip):
     conn = sqlite3.connect('public_ips.db')  # Connect to the SQLite database
     cursor = conn.cursor()
     print('connecting to DB')
 
-    existing_ips = get_stored_public_ips(instance_name)  # Get existing IPs for instance name
+    existing_ips = get_stored_public_ips(instance_id)  # Get existing IPs for instance id
     if public_ip not in existing_ips:
-        print('storing ip in DB')
-        print(instance_name)
-        print(public_ip)
-        cursor.execute("INSERT INTO public_ips (instance_name, ip) VALUES (?, ?)", (instance_name, public_ip))
+        print('storing {}\'s ip in DB', instance_name)
+        cursor.execute("INSERT INTO public_ips (instance_id, instance_name, public_ip) VALUES (?, ?, ?)", (instance_id, instance_name, public_ip))
     else:
         print("IP already exists in database")
         
     conn.commit()
     conn.close()
 
-def get_stored_public_ips(instance_name):
+def get_stored_public_ips(instance_id):
     conn = sqlite3.connect('public_ips.db')
     cursor = conn.cursor()
-    cursor.execute("SELECT ip FROM public_ips WHERE instance_name = ?", (instance_name,))
-    stored_ips = [row[0] for row in cursor.fetchall()]
+    cursor.execute("SELECT public_ip FROM public_ips WHERE instance_id = ?", (instance_id,))
+    stored_ips = cursor.fetchall()
     conn.close()
-    return stored_ips
+    ips = []
+    for row in stored_ips:
+        ips.append(row[0])
+    return ips
 
 def download_csv(data):
-    #print(data)
     df = pd.DataFrame(data)
-    #print(df)
     csv_filename = 'ips_per_instance.csv'
     df.to_csv(csv_filename, index=False)
-    #st.download_button('Download CSV', csv_filename)
+
+def download_all_csv(data):
+    df = pd.DataFrame(data)
+    csv_filename = 'all_instance_ips.csv'
+    df.to_csv(csv_filename, index=False)
+
+def get_stored_public_ip_with_time(instance_id):
+    conn = sqlite3.connect('public_ips.db')
+    cursor = conn.cursor()
+    #select ip and timestamp
+    cursor.execute("SELECT public_ip, timestamp FROM public_ips WHERE instance_id = ?", (instance_id,))
+    stored_ips_with_timestamp = cursor.fetchall()
+    ips = []
+    for row in stored_ips_with_timestamp:
+        ips.append({'public_ip': row[0], 'timestamp': row[1]})   
+    conn.close()
+    return ips
+
+def get_all_history():
+    conn = sqlite3.connect('public_ips.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM public_ips")
+    all_history = cursor.fetchall()
+    conn.close()
+    ips = []
+    for history in all_history:
+        ips.append({'instance_id': history[0], 
+                'instance_name': history[1],
+                'public_ip': history[2], 
+                'timestamp': history[3]
+                })
+    return ips
 
 def main():
     instances = get_instances()
-    
+
     correlated_instances = []
     for instance in instances:
         instance_id = instance['instance_id']
@@ -276,7 +313,7 @@ def main():
         state = instance['state']
         #if public ip is not NA then store in database
         if public_ip != 'NA':
-            store_public_ips(instance_name, public_ip)
+            store_public_ips(instance_id, instance_name, public_ip)
         streamlit_data.append({
             'instance_name': instance_name,
             'public_ip': public_ip,
@@ -309,6 +346,8 @@ def main():
 
     # add button to rotate IPs
     if st.button("Rotate IPs"):
+        #st.write("Rotate IPs")
+        #print instance name in selected row
         for i in sel_row:
             print(i['instance_name'])
             print(i['public_ip'])
@@ -335,7 +374,9 @@ def main():
             st.write(i['instance_name'])
             for instance in correlated_instances:
                 if i['instance_id'] == instance['instance_id']:
+                    #print(instance['allowed_ports'])
                     for rules in instance['allowed_ports']:
+                        #print(rules)
                         #import into pandas dataframe
                         df_rules = pd.DataFrame(rules)
                         st.write(df_rules)
@@ -345,18 +386,29 @@ def main():
         instance_names = [] 
         for i in sel_row:
             st.write(i['instance_name'])
-            public_ips = get_stored_public_ips(i['instance_name'])
-            instance_names.append({
-                'instance_name': i['instance_name'],
-                'public_ips': public_ips
-                })
-            if public_ips:
-                for ips in public_ips:
+            #public_ips = get_stored_public_ips(i['instance_id'])
+            public_ip_with_times = get_stored_public_ip_with_time(i['instance_id'])
+
+            if public_ip_with_times:
+                for ips in public_ip_with_times:
+                    instance_names.append({
+                        'instance_name': i['instance_name'],
+                        'instance_id':i['instance_id'],
+                        'public_ips': ips['public_ip'], 
+                        'timestamp': ips['timestamp']
+                        })
                     st.write(ips)
             else:
                 st.write("No IP history found for: ", instance_name)
         download_csv(instance_names)
         st.write("Results Saved to: %s/ips_per_instance.csv" % os.getcwd())
+    
+    #add button to export every instance's IP history
+    if st.button("Export All Instance IP History"):
+        print("Export All Instance IP History")
+        all_instance_history = get_all_history()
+        download_all_csv(all_instance_history)
+        st.write("Results Saved to: %s/all_instance_ips.csv" % os.getcwd())
 
 if __name__ == "__main__":
     create_database()

@@ -34,7 +34,7 @@ def correlate_security_groups(instances, group):
         except KeyError:
             pass
         
-    # # identify which instance is associated with which security group in allowed_ports
+    # identify which instance is associated with which security group in allowed_ports
     correlated_security_group = []
     for allowed_ports in group['allowed_ports']:
         for sg in allowed_ports:
@@ -58,7 +58,6 @@ def correlate_security_groups(instances, group):
                 instance_names.append('NA')
                 sg['Service or Instance'] = instance_names
             correlated_security_group.append(sg)
-                    
     return correlated_security_group
 
 def get_open_ports(security_group_id):
@@ -70,7 +69,6 @@ def get_open_ports(security_group_id):
     allowed_ports = []
     
     for permission in ip_permissions:
-        
         from_port = permission.get('FromPort', 'NA')
         to_port = permission.get('ToPort', 'NA')
         protocol = permission.get('IpProtocol', 'NA')
@@ -98,7 +96,7 @@ def get_open_ports(security_group_id):
                     'IPRange': 'NA',
                     'GroupID': group_id
                 })
-        
+                
     for permission in ip_permissions_egress:
         from_port = permission.get('FromPort', 'NA')
         to_port = permission.get('ToPort', 'NA')
@@ -127,15 +125,15 @@ def get_open_ports(security_group_id):
                     'IPRange': 'NA',
                     'GroupID': group_id
                 })
-
     return allowed_ports
 
+@st.cache_data
 def get_instances():
     session = boto3.Session()
     ec2_client = session.client('ec2')
     response = ec2_client.describe_instances()
     instances = []
-
+    
     for reservation in response['Reservations']:
         for instance in reservation['Instances']:
             instance_id = instance['InstanceId']
@@ -190,13 +188,13 @@ def rotate_elastic_ip(instance_name, instance_id, public_ip):
 
     #release current elastic IP
     response_release_ip = ec2_client.release_address(AllocationId=current_allocation_id)
-    
+
     #allocate new elastic IP
     response_new_ip = ec2_client.allocate_address(Domain='vpc')['PublicIp']
-    
+
     #associate new elastic IP
     response_associate = ec2_client.associate_address(PublicIp=response_new_ip, InstanceId=instance_id)
-    
+
     #return new elastic IP
     store_public_ips(instance_id, instance_name, response_new_ip)
     return response_new_ip
@@ -225,8 +223,9 @@ def store_public_ips(instance_id, instance_name, public_ip):
     print('connecting to DB')
 
     existing_ips = get_stored_public_ips(instance_id)  # Get existing IPs for instance id
+    #print(existing_ips)
     if public_ip not in existing_ips:
-        print('storing {}\'s ip in DB', instance_name)
+        print(f"storing {instance_name}\'s ip in DB")
         cursor.execute("INSERT INTO public_ips (instance_id, instance_name, public_ip) VALUES (?, ?, ?)", (instance_id, instance_name, public_ip))
     else:
         print("IP already exists in database")
@@ -243,6 +242,7 @@ def get_stored_public_ips(instance_id):
     ips = []
     for row in stored_ips:
         ips.append(row[0])
+    #print(ips)
     return ips
 
 def download_csv(data):
@@ -281,10 +281,8 @@ def get_all_history():
                 'timestamp': history[3]
                 })
     return ips
-
-def main():
-    instances = get_instances()
-
+    
+def correlate(instances):
     correlated_instances = []
     for instance in instances:
         instance_id = instance['instance_id']
@@ -303,8 +301,10 @@ def main():
             'security_groups': security_groups,
             'allowed_ports': allowed_ports
         })
+    return correlated_instances
 
-    streamlit_data = []
+def streamlit_data(instances):
+    data = []
     for instance in instances:
         instance_id = instance['instance_id']
         instance_name = instance['instance_name']
@@ -314,22 +314,24 @@ def main():
         #if public ip is not NA then store in database
         if public_ip != 'NA':
             store_public_ips(instance_id, instance_name, public_ip)
-        streamlit_data.append({
+        data.append({
             'instance_name': instance_name,
             'public_ip': public_ip,
             'private_ip': private_ip, 
             'state': state,
             'instance_id': instance_id
         })
+    return data
+
+def main():
+    instances = get_instances()
+    data = streamlit_data(instances)
     
     #convert correlated_instances to dataframe
-    df = pd.DataFrame(streamlit_data)
-
+    df = pd.DataFrame(data)
     gd = GridOptionsBuilder.from_dataframe(df)
     gd.configure_pagination(enabled=True)
     gd.configure_default_column(groupable=True, editable=True)
-    #selection_mode = st.radio("Selection Mode", ['multiple'])
-    #gd.configure_selection(selection_mode=selection_mode, use_checkbox=True)
     gd.configure_selection(selection_mode='multiple', use_checkbox=True)
     grid_options = gd.build()
 
@@ -346,7 +348,6 @@ def main():
 
     # add button to rotate IPs
     if st.button("Rotate IPs"):
-        #st.write("Rotate IPs")
         #print instance name in selected row
         for i in sel_row:
             print(i['instance_name'])
@@ -354,7 +355,8 @@ def main():
             new_ip = rotate_elastic_ip(i['instance_name'],i['instance_id'], i['public_ip'])
             print(new_ip)
             #refresh AG Grid
-        time.sleep(5)
+        time.sleep(2)
+        st.cache_data.clear()
         st.experimental_rerun()
 
     # add button to restart EC2 instances
@@ -364,29 +366,28 @@ def main():
             print(i['instance_name'])
             restart_instance(i['instance_name'],i['instance_id'])
         #refresh AG Grid
-        time.sleep(5)
+        time.sleep(2)
         st.experimental_rerun()
 
     # add button to restart EC2 instances
     if st.button("Show Egress/Ingress Ports"):
         print("Show Egress/Ingress Ports")
+        correlated_instances = correlate(instances)
         for i in sel_row:
             st.write(i['instance_name'])
             for instance in correlated_instances:
                 if i['instance_id'] == instance['instance_id']:
-                    #print(instance['allowed_ports'])
                     for rules in instance['allowed_ports']:
-                        #print(rules)
                         #import into pandas dataframe
                         df_rules = pd.DataFrame(rules)
                         st.write(df_rules)
+                        
     # add button to restart EC2 instances
     if st.button("Export IP History"):
         print("Export IP History")
         instance_names = [] 
         for i in sel_row:
             st.write(i['instance_name'])
-            #public_ips = get_stored_public_ips(i['instance_id'])
             public_ip_with_times = get_stored_public_ip_with_time(i['instance_id'])
 
             if public_ip_with_times:

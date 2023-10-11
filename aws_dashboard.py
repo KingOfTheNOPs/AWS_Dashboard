@@ -184,14 +184,61 @@ def rotate_elastic_ip(instance_name, instance_id, public_ip):
         st.write("Not allowed to dissassociate IP for : ", instance_name)
         return
 
+    print(f"Instance Name: {instance_name}")
     #release current elastic IP
     response_release_ip = ec2_client.release_address(AllocationId=current_allocation_id)
 
     #allocate new elastic IP
     response_new_ip = ec2_client.allocate_address(Domain='vpc')['PublicIp']
-
+    
     #associate new elastic IP
     response_associate = ec2_client.associate_address(PublicIp=response_new_ip, InstanceId=instance_id)
+
+    #get allocation and association IDs
+    response_rotated_ip = ec2_client.describe_addresses(PublicIps=[response_new_ip])
+    #get allocation_id
+    new_allocation_id = response_rotated_ip['Addresses'][0]['AllocationId']
+    #get association_id
+    new_association_id = response_rotated_ip['Addresses'][0]['AssociationId']
+    
+    print(f"New allocation ID: {new_allocation_id}")
+    print(f"New association ID: {new_association_id}")
+    print(f"New IP: {response_new_ip}")
+
+    #run terraform import for new elastic allocation ID
+    current_dir = os.getcwd()
+    #search for terraform.tfstate file
+    for root, dirs, files in os.walk('/home/vnc'):
+        for file in files:
+            if file.endswith("terraform.tfstate"):
+                tfstate_file = os.path.join(root, file)
+
+    print(tfstate_file)
+    #change dirs to terraform.tfstate file
+    os.chdir(os.path.dirname(tfstate_file))
+    # get characters before - in instance name
+    split_instance_name = instance_name.split('-') 
+    index = instance_name.find(split_instance_name[0])
+    # print("Split")
+    terraform_name = split_instance_name[0].lower()
+    # print()
+
+    #remove current elastic IP from terraform.tfstate file
+    remove_eip_terraform_cmd = f"terraform state rm aws_eip.{terraform_name}[\\\"{instance_name[index + len(split_instance_name[0])+1:]}\\\"]"
+    os.system(remove_eip_terraform_cmd)
+    remove_allocation_terraform_cmd = f"terraform state rm aws_eip_association.{terraform_name}[\\\"{instance_name[index + len(split_instance_name[0])+1:]}\\\"]"
+    os.system(remove_allocation_terraform_cmd)
+
+    #run terraform import
+    eip_import_cmd = f"terraform import aws_eip.{terraform_name}[\\\"{instance_name[index + len(split_instance_name[0])+1:]}\\\"] {new_allocation_id}"
+    print(eip_import_cmd)
+    os.system(eip_import_cmd)
+    allocation_import_cmd = f"terraform import aws_eip_association.{terraform_name}[\\\"{instance_name[index + len(split_instance_name[0])+1:]}\\\"] {new_association_id}"
+    print(allocation_import_cmd)
+    os.system(allocation_import_cmd)
+
+    #change dirs back to current dir
+    os.chdir(current_dir)
 
     #return new elastic IP
     store_public_ips(instance_id, instance_name, response_new_ip)
@@ -338,17 +385,22 @@ def main():
     grid_options = gd.build()
 
     grid_table = AgGrid(
-        df, 
+        df,
+        fit_columns_on_grid_load=True, 
         gridOptions=grid_options, 
         update_mode=GridUpdateMode.SELECTION_CHANGED, 
         allow_unsafe_jscode=True, 
-        width='100%', 
-        height='500px'
+        width='100%' 
     )
 
     sel_row = grid_table['selected_rows']
     
     # add button to rotate IPs
+    if st.button("Refresh Dashboard Data"):
+        time.sleep(1)
+        st.cache_data.clear()
+        st.experimental_rerun()
+
     if st.button("Rotate IPs"):
         #print instance name in selected row
         for i in sel_row:
